@@ -1,0 +1,37 @@
+# 数据集配置
+dataset:
+  root_dir: ''  # nuScenes数据集根目录
+  version: 'v1.0-trainval'
+  split: 'train'
+  image_size: [150, 240]
+  max_points: 1000
+
+# 模型配置
+model:
+  input_shape: [150, 240, 3]
+  dropout_rate: 0.0
+  l2_reg: 0.0
+  mid_layer_activation: 'relu'
+
+# 训练配置
+training:
+  batch_size: 32
+  epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler:
+    type: 'cosine'
+    T_max: 100
+    eta_min: 1e-6
+
+# 损失函数权重
+loss_weights:
+  quaternion: 1.0
+  depth_map: 1.0
+  point_cloud: 1.0
+
+# 日志配置
+logging:
+  log_dir: 'logs'
+  save_freq: 5
+  eval_freq: 1 
