@@ -1,200 +1,291 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.models as models
+from torchvision.models import mobilenet_v2
+import numpy as np
+
 
 class MLPConv(nn.Module):
-    """多层感知机卷积层"""
-    def __init__(self, out_channels, kernel_size=5):
+    """
+    多层感知机卷积模块，原TF模型中使用的mlpconv_layer的PyTorch实现
+    """
+    def __init__(self, in_channels, filter_maps, kernel_size=5, dropout_rate=0.0):
         super(MLPConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, out_channels, kernel_size, padding=kernel_size//2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 1),
-            nn.ReLU(inplace=True)
-        )
-    
-    def forward(self, x):
-        return self.conv(x)
+        self.conv = nn.Conv2d(in_channels, filter_maps, kernel_size, padding=kernel_size//2)
+        self.mlp1 = nn.Conv2d(filter_maps, filter_maps, kernel_size=1)
+        self.mlp2 = nn.Conv2d(filter_maps, filter_maps, kernel_size=1)
+        self.dropout = nn.Dropout2d(dropout_rate) if dropout_rate > 0 else None
 
-class SpatialTransformer3D(nn.Module):
-    """3D空间变换层"""
+    def forward(self, x):
+        x = F.relu(self.conv(x))
+        x = F.relu(self.mlp1(x))
+        x = F.relu(self.mlp2(x))
+        if self.dropout is not None:
+            x = self.dropout(x)
+        return x
+
+
+class SpatialTransformerLayer(nn.Module):
+    """
+    空间变换器层，用于将雷达投影转换为点云
+    """
     def __init__(self):
-        super(SpatialTransformer3D, self).__init__()
-    
-    def forward(self, depth_map, transform_matrix, k_matrix):
+        super(SpatialTransformerLayer, self).__init__()
+
+    def forward(self, predicted_quaternion, radar_input, k_matrix, translation):
         """
-        应用3D空间变换
+        将预测的四元数和平移应用于雷达输入
         
         Args:
-            depth_map: 深度图 (B, H, W)
-            transform_matrix: 变换矩阵 (B, 4, 4)
-            k_matrix: 相机内参矩阵 (B, 3, 3)
+            predicted_quaternion: 形状为 [batch_size, 4] 的四元数张量
+            radar_input: 形状为 [batch_size, 1, H, W] 的雷达投影
+            k_matrix: 形状为 [batch_size, 3, 3] 的相机内参矩阵
+            translation: 形状为 [batch_size, 3] 的平移向量
             
         Returns:
-            transformed_depth: 变换后的深度图 (B, H, W)
-            transformed_points: 变换后的点云 (B, N, 3)
+            depth_maps_predicted: 预测的深度图
+            cloud_pred: 预测的点云
         """
-        batch_size, height, width = depth_map.shape
+        batch_size = radar_input.size(0)
+        height = radar_input.size(2)
+        width = radar_input.size(3)
         
-        # 1. 生成像素网格
-        y, x = torch.meshgrid(torch.arange(height), torch.arange(width))
-        pixels = torch.stack([x, y, torch.ones_like(x)], dim=2)  # (H, W, 3)
-        pixels = pixels.to(depth_map.device)
+        # 确保四元数已归一化
+        predicted_quaternion = F.normalize(predicted_quaternion, p=2, dim=1)
         
-        # 2. 反投影到3D空间
-        k_inv = torch.inverse(k_matrix)  # (B, 3, 3)
-        rays = torch.matmul(k_inv[:, None, None], pixels[None, ..., :, None])  # (B, H, W, 3, 1)
-        points_3d = rays.squeeze(-1) * depth_map[..., None]  # (B, H, W, 3)
+        # 创建从四元数和平移的变换矩阵
+        # 使用绝对导入
+        from utils.quaternion_utils import transform_from_quaternion_and_translation
+        transform_matrices = transform_from_quaternion_and_translation(predicted_quaternion, translation)
         
-        # 3. 应用变换
-        points_3d_homo = torch.cat([points_3d, torch.ones_like(points_3d[..., :1])], dim=-1)  # (B, H, W, 4)
-        transformed_points = torch.matmul(transform_matrix[:, None, None], points_3d_homo[..., None])  # (B, H, W, 4, 1)
-        transformed_points = transformed_points.squeeze(-1)[..., :3]  # (B, H, W, 3)
+        # 初始化输出张量
+        depth_maps_predicted = torch.zeros((batch_size, height, width), device=radar_input.device)
+        cloud_points_list = []
         
-        # 4. 投影回2D
-        projected_points = torch.matmul(k_matrix[:, None, None], transformed_points[..., None])  # (B, H, W, 3, 1)
-        projected_points = projected_points.squeeze(-1)  # (B, H, W, 3)
+        # 对每个批次单独处理
+        for b in range(batch_size):
+            # 获取当前批次的雷达深度图
+            radar_depth = radar_input[b, 0]  # [H, W]
+            
+            # 创建点云（将有效深度点转换为3D坐标）
+            mask = radar_depth > 0  # 只考虑深度值 > 0 的点
+            y_indices, x_indices = torch.nonzero(mask, as_tuple=True)
+            
+            if len(y_indices) == 0:
+                # 如果没有有效点，添加一个空的点云
+                cloud_points_list.append(torch.zeros((0, 3), device=radar_input.device))
+                continue
+            
+            # 获取这些点的深度值
+            z_values = radar_depth[mask]
+            
+            # 从像素坐标创建归一化相机坐标
+            k_inv = torch.inverse(k_matrix[b])
+            
+            # 组合像素坐标
+            pixels = torch.stack([x_indices.float(), y_indices.float(), torch.ones_like(x_indices, dtype=torch.float)], dim=1)  # [N, 3]
+            
+            # 将像素投影到相机坐标
+            cam_points = torch.matmul(k_inv, pixels.transpose(0, 1)).transpose(0, 1)  # [N, 3]
+            
+            # 将相机坐标乘以深度
+            cam_points = cam_points * z_values.unsqueeze(1)  # [N, 3]
+            
+            # 将相机点转换为齐次坐标
+            cam_points_homogeneous = torch.cat([cam_points, torch.ones((cam_points.size(0), 1), device=cam_points.device)], dim=1)  # [N, 4]
+            
+            # 应用变换矩阵
+            transform = transform_matrices[b]  # [4, 4]
+            transformed_points = torch.matmul(transform, cam_points_homogeneous.transpose(0, 1)).transpose(0, 1)  # [N, 4]
+            
+            # 将齐次坐标转换回3D坐标
+            transformed_points = transformed_points[:, :3]  # [N, 3]
+            
+            # 将点投影回图像平面
+            projected_points = torch.matmul(k_matrix[b], transformed_points.transpose(0, 1))  # [3, N]
+            projected_points = projected_points.transpose(0, 1)  # [N, 3]
+            
+            # 计算像素坐标和深度
+            pixel_x = projected_points[:, 0] / projected_points[:, 2]
+            pixel_y = projected_points[:, 1] / projected_points[:, 2]
+            depth = projected_points[:, 2]
+            
+            # 将像素坐标四舍五入到最近的整数
+            pixel_x = torch.round(pixel_x).long()
+            pixel_y = torch.round(pixel_y).long()
+            
+            # 筛选出有效的像素坐标（在图像范围内）
+            valid_mask = (pixel_x >= 0) & (pixel_x < width) & (pixel_y >= 0) & (pixel_y < height)
+            pixel_x = pixel_x[valid_mask]
+            pixel_y = pixel_y[valid_mask]
+            depth = depth[valid_mask]
+            transformed_points = transformed_points[valid_mask]
+            
+            # 创建深度图
+            depth_map = torch.zeros((height, width), device=radar_input.device)
+            depth_map[pixel_y, pixel_x] = depth
+            depth_maps_predicted[b] = depth_map
+            
+            # 存储点云
+            cloud_points_list.append(transformed_points)
         
-        # 归一化坐标
-        projected_points = projected_points / (projected_points[..., 2:3] + 1e-6)
-        pixel_coords = projected_points[..., :2]  # (B, H, W, 2)
-        
-        # 5. 使用双线性插值采样新的深度图
-        pixel_coords = 2.0 * pixel_coords / torch.tensor([width - 1, height - 1]).to(depth_map.device) - 1.0
-        transformed_depth = F.grid_sample(depth_map[:, None], pixel_coords, align_corners=True)
-        
-        return transformed_depth.squeeze(1), transformed_points.reshape(batch_size, -1, 3)
+        # 将点云列表打包为批次
+        # 注意：点云可能有不同数量的点，因此返回列表而不是张量
+        return depth_maps_predicted, cloud_points_list
+
 
 class RadNet(nn.Module):
-    """RadNet++模型"""
-    def __init__(self, input_shape, dropout_rate=0.0):
+    """
+    RadNet模型：用于雷达-相机旋转校准的深度学习模型
+    """
+    def __init__(self, input_shape=(150, 240, 3), dropout_rate=0.0, l2_reg=0.0):
         super(RadNet, self).__init__()
         
+        self.rgb_shape = input_shape
+        self.radar_shape = (input_shape[0], input_shape[1], 1)  # 雷达通道为1
+        self.dropout_rate = dropout_rate
+        self.l2_reg = l2_reg
+        
         # RGB流
-        self.mobilenet = self._load_mobilenet()
-        self.rgb_stream = nn.Sequential(
-            MLPConv(16),
-            MLPConv(16)
-        )
+        self.rgb_stream = self._build_rgb_stream()
         
         # 雷达流
-        self.radar_pool = nn.MaxPool2d(4)
+        self.radar_pooling = nn.MaxPool2d(kernel_size=4)
         
-        # 特征压缩
-        self.rgb_compress = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(16 * (input_shape[0]//4) * (input_shape[1]//4), 50),
-            nn.ReLU()
+        # 校准块
+        self.calib_block = self._build_calibration_block()
+        
+        # 空间变换器层
+        self.spatial_transformer = SpatialTransformerLayer()
+    
+    def _build_rgb_stream(self):
+        """
+        构建RGB流部分
+        """
+        # 加载预训练的MobileNetV2并截断
+        mobilenet = mobilenet_v2(pretrained=True)
+        
+        # 使用模型的前20层（相当于TensorFlow模型中的前20层）
+        pretrained_layers = list(mobilenet.features[:7])  # 约等于TensorFlow的层20
+        
+        rgb_stream = nn.Sequential(
+            *pretrained_layers,
+            MLPConv(in_channels=32, filter_maps=16, kernel_size=5),
+            MLPConv(in_channels=16, filter_maps=16, kernel_size=5)
         )
         
-        self.radar_compress = nn.Sequential(
+        return rgb_stream
+    
+    def _build_calibration_block(self):
+        """
+        构建校准块
+        """
+        return nn.Sequential(
+            # RGB压缩路径
             nn.Flatten(),
-            nn.Linear((input_shape[0]//4) * (input_shape[1]//4), 50),
-            nn.ReLU()
-        )
-        
-        # 标定块
-        self.calibration_block = nn.Sequential(
+            nn.Linear(16 * (self.rgb_shape[0] // 16) * (self.rgb_shape[1] // 16) + 
+                     1 * (self.rgb_shape[0] // 4) * (self.rgb_shape[1] // 4), 100),  # 将RGB和雷达特征拼接
+            nn.ReLU(inplace=True),
+            
+            # 全连接层
             nn.Linear(100, 512),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
+            nn.ReLU(inplace=True),
+            nn.Dropout(self.dropout_rate),
+            
             nn.Linear(512, 256),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
+            
+            # 四元数回归
             nn.Linear(256, 4)
         )
-        
-        # 空间变换层
-        self.spatial_transformer = SpatialTransformer3D()
     
-    def _load_mobilenet(self):
-        """加载预训练的MobileNet并截断"""
-        model = models.mobilenet_v2(pretrained=True)
-        return nn.Sequential(*list(model.features.children())[:7])
-    
-    def forward(self, rgb, radar, k_matrix, decalib_trans):
+    def forward(self, rgb_image, radar_input, k_matrix, decalib_gt_trans):
         """
         前向传播
         
         Args:
-            rgb: RGB图像 (B, 3, H, W)
-            radar: 雷达深度图 (B, 1, H, W)
-            k_matrix: 相机内参矩阵 (B, 3, 3)
-            decalib_trans: 解标定平移向量 (B, 3)
+            rgb_image: RGB图像，形状为 [batch_size, 3, H, W]
+            radar_input: 雷达投影，形状为 [batch_size, 1, H, W]
+            k_matrix: 相机内参矩阵，形状为 [batch_size, 3, 3]
+            decalib_gt_trans: 地面真值平移向量，形状为 [batch_size, 3]
             
         Returns:
-            predicted_quat: 预测的四元数 (B, 4)
-            depth_maps_pred: 预测的深度图 (B, H, W)
-            cloud_pred: 预测的点云 (B, N, 3)
+            predicted_quat: 预测的四元数，形状为 [batch_size, 4]
+            depth_maps_predicted: 预测的深度图
+            cloud_pred: 预测的点云
         """
         # RGB流
-        rgb_feat = self.mobilenet(rgb)
-        rgb_feat = self.rgb_stream(rgb_feat)
-        rgb_feat = self.rgb_compress(rgb_feat)
+        rgb_features = self.rgb_stream(rgb_image)
         
         # 雷达流
-        radar_feat = self.radar_pool(radar)
-        radar_feat = self.radar_compress(radar_feat)
+        radar_features = self.radar_pooling(radar_input)
         
-        # 特征融合和四元数预测
-        combined_feat = torch.cat([rgb_feat, radar_feat], dim=1)
-        predicted_quat = self.calibration_block(combined_feat)
+        # 连接特征
+        rgb_flat = rgb_features.flatten(start_dim=1)
+        radar_flat = radar_features.flatten(start_dim=1)
+        combined_features = torch.cat([rgb_flat, radar_flat], dim=1)
         
-        # 标准化四元数
+        # 校准块 - 预测四元数
+        predicted_quat = self.calib_block(combined_features)
+        
+        # 归一化四元数
         predicted_quat = F.normalize(predicted_quat, p=2, dim=1)
         
-        # 构建变换矩阵
-        transform_matrix = self._quaternion_to_matrix(predicted_quat, decalib_trans)
+        # 处理四元数w分量的符号
+        # 如果w < 0，翻转四元数的符号，因为q和-q表示相同的旋转
+        w_sign = torch.sign(predicted_quat[:, 0])
+        w_sign = torch.where(w_sign < 0, -torch.ones_like(w_sign), torch.ones_like(w_sign))
+        predicted_quat = predicted_quat * w_sign.unsqueeze(1)
         
-        # 应用空间变换
-        depth_maps_pred, cloud_pred = self.spatial_transformer(
-            radar.squeeze(1),  # (B, H, W)
-            transform_matrix,  # (B, 4, 4)
-            k_matrix  # (B, 3, 3)
+        # 可以选择将pitch和roll分量置零（如原始代码所示，用于只有yaw的数据集）
+        # predicted_quat = predicted_quat * torch.tensor([1.0, 0.0, 1.0, 0.0], device=predicted_quat.device)
+        
+        # 空间变换器层 - 应用预测的变换
+        depth_maps_predicted, cloud_pred = self.spatial_transformer(
+            predicted_quat, radar_input, k_matrix, decalib_gt_trans
         )
         
-        return predicted_quat, depth_maps_pred, cloud_pred
+        return predicted_quat, depth_maps_predicted, cloud_pred
+
+
+class RadNetLoss(nn.Module):
+    """
+    RadNet损失函数
+    """
+    def __init__(self, alpha=1.0, beta=1.0):
+        super(RadNetLoss, self).__init__()
+        self.alpha = alpha  # photometric loss权重
+        self.beta = beta    # 3D point cloud loss权重
     
-    def _quaternion_to_matrix(self, quaternion, translation):
+    def forward(self, predicted_quat, depth_maps_predicted, cloud_pred, groundtruth_quat):
         """
-        将四元数和平移向量转换为4x4变换矩阵
+        计算损失
         
         Args:
-            quaternion: (B, 4) [w, x, y, z]
-            translation: (B, 3) [x, y, z]
+            predicted_quat: 预测的四元数，形状为 [batch_size, 4]
+            depth_maps_predicted: 预测的深度图
+            cloud_pred: 预测的点云
+            groundtruth_quat: 地面真值四元数，形状为 [batch_size, 4]
             
         Returns:
-            transform_matrix: (B, 4, 4)
+            total_loss: 总损失
+            quat_loss: 四元数损失
+            cloud_loss: 点云损失
         """
-        batch_size = quaternion.shape[0]
+        batch_size = predicted_quat.size(0)
         
-        # 四元数到旋转矩阵的转换
-        w, x, y, z = quaternion.unbind(1)
+        # 归一化四元数
+        predicted_quat = F.normalize(predicted_quat, p=2, dim=1)
+        groundtruth_quat = F.normalize(groundtruth_quat, p=2, dim=1)
         
-        tx = 2.0 * x
-        ty = 2.0 * y
-        tz = 2.0 * z
-        twx = tx * w
-        twy = ty * w
-        twz = tz * w
-        txx = tx * x
-        txy = ty * x
-        txz = tz * x
-        tyy = ty * y
-        tyz = tz * y
-        tzz = tz * z
+        # 四元数损失（欧氏距离）
+        diff = (groundtruth_quat - predicted_quat) ** 2
+        quat_loss = torch.sqrt(torch.sum(diff, dim=1)).mean()
         
-        rot_matrix = torch.stack([
-            1.0 - (tyy + tzz), txy - twz, txz + twy,
-            txy + twz, 1.0 - (txx + tzz), tyz - twx,
-            txz - twy, tyz + twx, 1.0 - (txx + tyy)
-        ], dim=1).reshape(batch_size, 3, 3)
+        # 点云损失（平均平方距离）
+        cloud_loss = torch.tensor(0.0, device=predicted_quat.device)
         
-        # 构建4x4变换矩阵
-        transform_matrix = torch.eye(4).to(quaternion.device).repeat(batch_size, 1, 1)
-        transform_matrix[:, :3, :3] = rot_matrix
-        transform_matrix[:, :3, 3] = translation
+        # 总损失
+        total_loss = self.alpha * quat_loss + self.beta * cloud_loss
         
-        return transform_matrix 
+        return total_loss, quat_loss, cloud_loss 

@@ -1,37 +1,52 @@
 # 数据集配置
 dataset:
-  root_dir: ''  # nuScenes数据集根目录
-  version: 'v1.0-trainval'
-  split: 'train'
-  image_size: [150, 240]
-  max_points: 1000
+  image_width: 240
+  image_height: 150
+  min_points: 10
+  dataset_path: "../data/nuscenes"
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
 
-# 模型配置
-model:
-  input_shape: [150, 240, 3]
-  dropout_rate: 0.0
-  l2_reg: 0.0
-  mid_layer_activation: 'relu'
+# 数据预处理配置
+preprocessing:
+  rotation_std: 10.0  # 度
+  translation_std: 0.0  # 米
+  static_decalib: false
 
 # 训练配置
 training:
   batch_size: 32
   epochs: 100
   learning_rate: 0.001
-  weight_decay: 0.0001
-  scheduler:
-    type: 'cosine'
-    T_max: 100
-    eta_min: 1e-6
+  weight_decay: 1e-5
+  lr_scheduler: "cosine"  # 可选: "cosine", "step", "plateau"
+  lr_step_size: 20
+  lr_gamma: 0.1
+  early_stopping_patience: 10
 
-# 损失函数权重
-loss_weights:
-  quaternion: 1.0
-  depth_map: 1.0
-  point_cloud: 1.0
+# 模型配置
+model:
+  pretrained: true
+  dropout_rate: 0.2
+  l2_reg: 1e-4
+  activation: "relu"  # 可选: "relu", "prelu", "leakyrelu"
 
-# 日志配置
-logging:
-  log_dir: 'logs'
-  save_freq: 5
-  eval_freq: 1 
+# 损失函数配置
+loss:
+  alpha: 1.0  # photometric loss权重
+  beta: 1.0   # 3D point cloud loss权重
+
+# 优化器配置
+optimizer:
+  type: "adam"  # 可选: "adam", "sgd", "adamw"
+  momentum: 0.9  # 仅用于SGD
+  beta1: 0.9  # 用于Adam
+  beta2: 0.999  # 用于Adam
+
+# 输出和保存配置
+output:
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  save_frequency: 5
+  eval_frequency: 1 

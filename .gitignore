@@ -9,3 +9,4 @@ dataset_utils/Radar_Depths_Histogram.png
 experiments*
 *.dat
 .idea
+RatNet-PyTorch/nuscenesData

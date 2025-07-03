@@ -1,64 +1,220 @@
 import torch
 import numpy as np
 
-def quaternion_multiply(q1, q2):
+
+def normalize_quaternions(quaternions):
+    """
+    归一化四元数
+    
+    Args:
+        quaternions: 形状为 [batch_size, 4] 的四元数张量
+    
+    Returns:
+        归一化后的四元数
+    """
+    norm = torch.norm(quaternions, dim=1, keepdim=True)
+    return quaternions / (norm + 1e-8)  # 添加小值避免除零错误
+
+
+def conjugate_quaternions(quaternions):
+    """
+    计算四元数的共轭
+    
+    Args:
+        quaternions: 形状为 [batch_size, 4] 的四元数张量
+    
+    Returns:
+        四元数的共轭
+    """
+    # 四元数格式: [w, x, y, z]
+    # 共轭: [w, -x, -y, -z]
+    conj = quaternions.clone()
+    conj[:, 1:] = -conj[:, 1:]
+    return conj
+
+
+def multiply_quaternions(q1, q2):
     """
     四元数乘法
     
     Args:
-        q1: (B, 4) 第一个四元数 [w, x, y, z]
-        q2: (B, 4) 第二个四元数 [w, x, y, z]
+        q1: 形状为 [batch_size, 4] 的四元数张量
+        q2: 形状为 [batch_size, 4] 的四元数张量
     
     Returns:
-        (B, 4) 乘法结果
+        q1 和 q2 相乘的结果
     """
-    w1, x1, y1, z1 = q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-1)
+    # 四元数格式: [w, x, y, z]
+    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
     
     w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
     x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
-    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
-    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    y = w1 * y2 + y1 * w2 + z1 * x2 - x1 * z2
+    z = w1 * z2 + z1 * w2 + x1 * y2 - y1 * x2
     
-    return torch.stack([w, x, y, z], dim=-1)
+    return torch.stack([w, x, y, z], dim=1)
 
-def quaternion_conjugate(q):
+
+def rotation_matrix_from_quaternion(quaternion):
     """
-    四元数共轭
+    从四元数计算旋转矩阵
     
     Args:
-        q: (B, 4) 四元数 [w, x, y, z]
+        quaternion: 形状为 [batch_size, 4] 的四元数张量 (w, x, y, z)
     
     Returns:
-        (B, 4) 共轭四元数 [w, -x, -y, -z]
+        形状为 [batch_size, 3, 3] 的旋转矩阵
     """
-    w, x, y, z = q.unbind(-1)
-    return torch.stack([w, -x, -y, -z], dim=-1)
+    # 确保四元数已归一化
+    quaternion = normalize_quaternions(quaternion)
+    
+    batch_size = quaternion.size(0)
+    
+    w, x, y, z = quaternion[:, 0], quaternion[:, 1], quaternion[:, 2], quaternion[:, 3]
+    
+    tx = 2.0 * x
+    ty = 2.0 * y
+    tz = 2.0 * z
+    twx = tx * w
+    twy = ty * w
+    twz = tz * w
+    txx = tx * x
+    txy = ty * x
+    txz = tz * x
+    tyy = ty * y
+    tyz = tz * y
+    tzz = tz * z
+    
+    matrix = torch.zeros((batch_size, 3, 3), device=quaternion.device)
+    
+    matrix[:, 0, 0] = 1.0 - (tyy + tzz)
+    matrix[:, 0, 1] = txy - twz
+    matrix[:, 0, 2] = txz + twy
+    matrix[:, 1, 0] = txy + twz
+    matrix[:, 1, 1] = 1.0 - (txx + tzz)
+    matrix[:, 1, 2] = tyz - twx
+    matrix[:, 2, 0] = txz - twy
+    matrix[:, 2, 1] = tyz + twx
+    matrix[:, 2, 2] = 1.0 - (txx + tyy)
+    
+    return matrix
 
-def quaternion_inverse(q):
+
+def transform_from_quaternion_and_translation(quaternion, translation):
     """
-    四元数逆
+    从四元数和平移向量创建变换矩阵
     
     Args:
-        q: (B, 4) 四元数 [w, x, y, z]
+        quaternion: 形状为 [batch_size, 4] 的四元数张量
+        translation: 形状为 [batch_size, 3] 的平移向量张量
     
     Returns:
-        (B, 4) 逆四元数
+        形状为 [batch_size, 4, 4] 的变换矩阵
     """
-    return quaternion_conjugate(q) / torch.sum(q * q, dim=-1, keepdim=True)
+    batch_size = quaternion.size(0)
+    
+    # 获取旋转矩阵
+    rotation_matrix = rotation_matrix_from_quaternion(quaternion)
+    
+    # 创建变换矩阵
+    transform = torch.zeros((batch_size, 4, 4), device=quaternion.device)
+    transform[:, :3, :3] = rotation_matrix
+    transform[:, :3, 3] = translation.squeeze(-1) if translation.dim() > 2 else translation
+    transform[:, 3, 3] = 1.0
+    
+    return transform
 
-def euler_to_quaternion(euler_angles):
+
+def quaternion_angular_error(q1, q2):
     """
-    欧拉角转四元数
+    计算两个四元数之间的角度误差（以度为单位）
     
     Args:
-        euler_angles: (B, 3) 欧拉角 [roll, pitch, yaw] (弧度)
+        q1: 形状为 [batch_size, 4] 的四元数张量
+        q2: 形状为 [batch_size, 4] 的四元数张量
     
     Returns:
-        (B, 4) 四元数 [w, x, y, z]
+        角度误差（度）
     """
-    roll, pitch, yaw = euler_angles.unbind(-1)
+    # 归一化四元数
+    q1 = normalize_quaternions(q1)
+    q2 = normalize_quaternions(q2)
     
+    # 计算内积
+    dot_product = torch.sum(q1 * q2, dim=1)
+    
+    # 确保dot_product在[-1, 1]范围内
+    dot_product = torch.clamp(dot_product, -1.0, 1.0)
+    
+    # 计算角度（弧度）
+    angle_rad = 2.0 * torch.acos(torch.abs(dot_product))
+    
+    # 转换为度
+    angle_deg = angle_rad * (180.0 / np.pi)
+    
+    return angle_deg
+
+
+def euler_from_quaternion(quaternion):
+    """
+    从四元数计算欧拉角（以度为单位）
+    
+    Args:
+        quaternion: 形状为 [batch_size, 4] 的四元数张量 (w, x, y, z)
+    
+    Returns:
+        形状为 [batch_size, 3] 的欧拉角张量 (roll, pitch, yaw)
+    """
+    # 确保四元数已归一化
+    quaternion = normalize_quaternions(quaternion)
+    
+    w, x, y, z = quaternion[:, 0], quaternion[:, 1], quaternion[:, 2], quaternion[:, 3]
+    
+    # 计算欧拉角
+    # Roll (x-axis rotation)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = torch.atan2(sinr_cosp, cosr_cosp)
+    
+    # Pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    # 使用条件操作处理奇异点
+    pitch = torch.where(
+        torch.abs(sinp) >= 1.0,
+        torch.sign(sinp) * (torch.pi / 2.0),  # use 90 degrees if out of range
+        torch.asin(sinp)
+    )
+    
+    # Yaw (z-axis rotation)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = torch.atan2(siny_cosp, cosy_cosp)
+    
+    # 转换为度
+    roll_deg = roll * (180.0 / np.pi)
+    pitch_deg = pitch * (180.0 / np.pi)
+    yaw_deg = yaw * (180.0 / np.pi)
+    
+    return torch.stack([roll_deg, pitch_deg, yaw_deg], dim=1)
+
+
+def quaternion_from_euler(euler_angles):
+    """
+    从欧拉角（以度为单位）计算四元数
+    
+    Args:
+        euler_angles: 形状为 [batch_size, 3] 的欧拉角张量 (roll, pitch, yaw)，单位为度
+    
+    Returns:
+        形状为 [batch_size, 4] 的四元数张量 (w, x, y, z)
+    """
+    # 转换为弧度
+    roll = euler_angles[:, 0] * (np.pi / 180.0)
+    pitch = euler_angles[:, 1] * (np.pi / 180.0)
+    yaw = euler_angles[:, 2] * (np.pi / 180.0)
+    
+    # 预计算角度的一半
     cy = torch.cos(yaw * 0.5)
     sy = torch.sin(yaw * 0.5)
     cp = torch.cos(pitch * 0.5)
@@ -66,55 +222,10 @@ def euler_to_quaternion(euler_angles):
     cr = torch.cos(roll * 0.5)
     sr = torch.sin(roll * 0.5)
     
+    # 四元数计算
     w = cr * cp * cy + sr * sp * sy
     x = sr * cp * cy - cr * sp * sy
     y = cr * sp * cy + sr * cp * sy
     z = cr * cp * sy - sr * sp * cy
     
-    return torch.stack([w, x, y, z], dim=-1)
-
-def quaternion_to_euler(quaternion):
-    """
-    四元数转欧拉角
-    
-    Args:
-        quaternion: (B, 4) 四元数 [w, x, y, z]
-    
-    Returns:
-        (B, 3) 欧拉角 [roll, pitch, yaw] (弧度)
-    """
-    w, x, y, z = quaternion.unbind(-1)
-    
-    # roll (x-axis rotation)
-    sinr_cosp = 2.0 * (w * x + y * z)
-    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-    roll = torch.atan2(sinr_cosp, cosr_cosp)
-    
-    # pitch (y-axis rotation)
-    sinp = 2.0 * (w * y - z * x)
-    pitch = torch.where(
-        torch.abs(sinp) >= 1,
-        torch.sign(sinp) * torch.tensor(np.pi / 2),
-        torch.asin(sinp)
-    )
-    
-    # yaw (z-axis rotation)
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    yaw = torch.atan2(siny_cosp, cosy_cosp)
-    
-    return torch.stack([roll, pitch, yaw], dim=-1)
-
-def quaternion_error(q1, q2):
-    """
-    计算两个四元数之间的角度误差
-    
-    Args:
-        q1: (B, 4) 第一个四元数
-        q2: (B, 4) 第二个四元数
-    
-    Returns:
-        (B,) 角度误差（弧度）
-    """
-    q_diff = quaternion_multiply(q1, quaternion_inverse(q2))
-    return 2 * torch.acos(torch.clamp(torch.abs(q_diff[..., 0]), -1.0, 1.0)) 
+    return torch.stack([w, x, y, z], dim=1) 
