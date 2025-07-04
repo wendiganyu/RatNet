@@ -10,3 +10,4 @@ experiments*
 *.dat
 .idea
 RatNet-PyTorch/nuscenesData
+RatNet-PyTorch/data/calibration_dataset

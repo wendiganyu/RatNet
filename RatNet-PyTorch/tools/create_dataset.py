@@ -51,7 +51,7 @@ def load_config(config_path):
     """
     加载配置文件
     """
-    with open(config_path, 'r') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     return config
 
@@ -278,22 +278,43 @@ def comp_uv_depth(K, h_gt, decalib, point):
     计算像素坐标和雷达深度
     
     Args:
-        K: 相机内参矩阵
-        h_gt: 地面真值变换矩阵
-        decalib: 去校准变换矩阵
-        point: 3D点坐标
+        K: 相机内参矩阵 (3x3或3x4) - 包含相机的内部参数（焦距、主点等）
+        h_gt: 地面真值变换矩阵 (4x4) - 从雷达到相机坐标系的变换矩阵
+        decalib: 去校准变换矩阵 (4x4) - 模拟校准误差的额外变换
+        point: 3D点坐标 [x,y,z,1] - 雷达坐标系中的点（齐次坐标）
         
     Returns:
-        像素坐标和深度 [u, v, depth]
+        像素坐标和深度 [u, v, depth] - 投影后的像素坐标和深度值
     """
     # 使用投影公式: z * (u, v, 1)^T = K * H * x
-    tmp = np.matmul(K, decalib)
-    tmp = np.matmul(tmp, h_gt)
-    point = np.matmul(tmp, point.transpose())
+    # 其中:
+    # x 是雷达坐标系中的3D点 [X, Y, Z, 1]^T
+    # H 是从雷达坐标系到相机坐标系的变换矩阵 (decalib * h_gt)
+    # K 是相机内参矩阵
+    # (u, v) 是投影后的像素坐标
+    # z 是点在相机坐标系中的深度
+    # 步骤1: 将点从雷达坐标系转换到相机坐标系
+    # 组合去校准和地面真值变换矩阵：decalib * h_gt
+    transform = np.matmul(decalib, h_gt)
+    # 应用变换矩阵到点坐标：[X_cam, Y_cam, Z_cam, 1]^T = transform * [X_radar, Y_radar, Z_radar, 1]^T
+    point_cam = np.matmul(transform, point.transpose())
     
-    if point[2] != 0:
-        return [point[0] / point[2], point[1] / point[2], point[2]]
+    # 步骤2: 应用相机内参矩阵进行透视投影
+    if K.shape[0] == 3 and K.shape[1] == 3:
+        # 如果K是3x3，需要取点的前三个坐标进行投影
+        # [z*u, z*v, z]^T = K * [X_cam, Y_cam, Z_cam]^T
+        point_proj = np.matmul(K, point_cam[:3])
     else:
+        # 如果K已经是3x4，直接进行投影
+        # [z*u, z*v, z]^T = K * [X_cam, Y_cam, Z_cam, 1]^T
+        point_proj = np.matmul(K, point_cam)
+    
+    # 步骤3: 归一化坐标 - 除以深度值z得到最终像素坐标
+    if point_proj[2] != 0:  # 确保深度值不为零，避免除零错误
+        # 计算像素坐标 u = (z*u)/z, v = (z*v)/z
+        return [point_proj[0] / point_proj[2], point_proj[1] / point_proj[2], point_proj[2]]
+    else:
+        # 如果深度为零，则返回None表示投影无效
         return None
 
 
@@ -369,12 +390,11 @@ def create_and_store_samples(image_radar_pairs, sample_names, rad_to_cam_calibra
         decalib_transform[:3, 3] = [tx, ty, tz]
         
         # 初始化稀疏矩阵的数据
-        csr_data = []
-        csr_indices = []
-        csr_indptr = [0]
-        csr_decalib_data = []
-        csr_decalib_indices = []
-        csr_decalib_indptr = [0]
+        # 为每一行创建列表存储信息
+        rows_data = [[] for _ in range(image_height)]
+        rows_indices = [[] for _ in range(image_height)]
+        rows_decalib_data = [[] for _ in range(image_height)]
+        rows_decalib_indices = [[] for _ in range(image_height)]
         
         # 遍历雷达点
         radar_points = radar_pcl.points
@@ -394,9 +414,9 @@ def create_and_store_samples(image_radar_pairs, sample_names, rad_to_cam_calibra
                 v = int(round(v))
                 
                 if valid_pixel_coordinates(u, v, image_height, image_width):
-                    # 将点添加到稀疏矩阵
-                    csr_indices.append(u)
-                    csr_data.append(depth)
+                    # 将点添加到对应行的列表中
+                    rows_indices[v].append(u)
+                    rows_data[v].append(depth)
                     
                     # 去校准投影
                     proj_decalib_result = comp_uv_depth(K, h_gt, decalib_transform, point)
@@ -407,12 +427,30 @@ def create_and_store_samples(image_radar_pairs, sample_names, rad_to_cam_calibra
                         v_decalib = int(round(v_decalib))
                         
                         if valid_pixel_coordinates(u_decalib, v_decalib, image_height, image_width):
-                            # 将去校准点添加到稀疏矩阵
-                            csr_decalib_indices.append(u_decalib)
-                            csr_decalib_data.append(depth_decalib)
-            
-            # 更新稀疏矩阵的行指针
+                            # 将去校准点添加到对应行的列表中
+                            rows_decalib_indices[v_decalib].append(u_decalib)
+                            rows_decalib_data[v_decalib].append(depth_decalib)
+        
+        # 构建CSR矩阵
+        # 将行数据合并成一维数组
+        csr_data = []
+        csr_indices = []
+        csr_indptr = [0]
+        
+        csr_decalib_data = []
+        csr_decalib_indices = []
+        csr_decalib_indptr = [0]
+        
+        # 构建地面真值投影的CSR矩阵
+        for row_data, row_indices in zip(rows_data, rows_indices):
+            csr_data.extend(row_data)
+            csr_indices.extend(row_indices)
             csr_indptr.append(len(csr_data))
+        
+        # 构建去校准投影的CSR矩阵
+        for row_data, row_indices in zip(rows_decalib_data, rows_decalib_indices):
+            csr_decalib_data.extend(row_data)
+            csr_decalib_indices.extend(row_indices)
             csr_decalib_indptr.append(len(csr_decalib_data))
         
         # 创建稀疏矩阵
@@ -516,13 +554,13 @@ def create_dataset_splits(output_path, train_ratio=0.8, val_ratio=0.1, test_rati
     test_files = all_files[val_idx:]
     
     # 保存分割列表
-    with open(os.path.join(output_path, 'train_files.txt'), 'w') as f:
+    with open(os.path.join(output_path, 'train_files.txt'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(train_files))
     
-    with open(os.path.join(output_path, 'val_files.txt'), 'w') as f:
+    with open(os.path.join(output_path, 'val_files.txt'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(val_files))
     
-    with open(os.path.join(output_path, 'test_files.txt'), 'w') as f:
+    with open(os.path.join(output_path, 'test_files.txt'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(test_files))
     
     print(f"数据集分割完成: 训练集 {len(train_files)} 样本, 验证集 {len(val_files)} 样本, 测试集 {len(test_files)} 样本")

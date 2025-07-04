@@ -37,7 +37,7 @@ class RadarCameraCalibDataset(Dataset):
         split_file = os.path.join(self.dataset_path, f"{self.split}_files.txt")
         
         if os.path.exists(split_file):
-            with open(split_file, 'r') as f:
+            with open(split_file, 'r', encoding='utf-8') as f:
                 sample_list = [line.strip() for line in f.readlines()]
             return sample_list
         else:
