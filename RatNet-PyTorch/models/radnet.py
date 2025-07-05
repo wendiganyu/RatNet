@@ -149,8 +149,31 @@ class RadNet(nn.Module):
         # RGB流
         self.rgb_stream = self._build_rgb_stream()
         
-        # 雷达流
-        self.radar_pooling = nn.MaxPool2d(kernel_size=4)
+        # 雷达流 - 使用卷积替代池化，确保输出尺寸合理
+        self.radar_conv = nn.Conv2d(
+            in_channels=1,  # 雷达输入为1通道
+            out_channels=8,  # 增加特征通道数
+            kernel_size=3,   # 3x3卷积核
+            stride=2,       # 下采样
+            padding=1       # 保持输出大小正确
+        )
+        
+        # 使用虚拟输入创建特征，以获取确切的特征大小
+        rgb_dummy = torch.zeros((1, 3, input_shape[0], input_shape[1]))
+        radar_dummy = torch.zeros((1, 1, input_shape[0], input_shape[1]))
+        
+        # 获取实际的特征大小
+        with torch.no_grad():
+            rgb_features = self.rgb_stream(rgb_dummy)
+            radar_features = self.radar_conv(radar_dummy)
+            radar_features = F.relu(radar_features)
+            
+            rgb_flat = rgb_features.flatten(start_dim=1)
+            radar_flat = radar_features.flatten(start_dim=1)
+            combined_features = torch.cat([rgb_flat, radar_flat], dim=1)
+            
+            self.feature_size = combined_features.shape[1]
+            print(f"计算得到的特征维度: {self.feature_size}")
         
         # 校准块
         self.calib_block = self._build_calibration_block()
@@ -181,10 +204,9 @@ class RadNet(nn.Module):
         构建校准块
         """
         return nn.Sequential(
-            # RGB压缩路径
-            nn.Flatten(),
-            nn.Linear(16 * (self.rgb_shape[0] // 16) * (self.rgb_shape[1] // 16) + 
-                     1 * (self.rgb_shape[0] // 4) * (self.rgb_shape[1] // 4), 100),  # 将RGB和雷达特征拼接
+            # 输入层
+            nn.Flatten(),  # 确保输入被展平
+            nn.Linear(self.feature_size, 100),  # 使用动态计算的特征大小
             nn.ReLU(inplace=True),
             
             # 全连接层
@@ -217,8 +239,14 @@ class RadNet(nn.Module):
         # RGB流
         rgb_features = self.rgb_stream(rgb_image)
         
-        # 雷达流
-        radar_features = self.radar_pooling(radar_input)
+        # 雷达流 - 首先确保输入维度正确 [batch, channels, height, width]
+        # 检查输入维度并调整
+        if radar_input.dim() == 4 and radar_input.size(1) != 1 and radar_input.size(3) == 1:
+            # 如果是 [batch, height, width, channels]，转换为 [batch, channels, height, width]
+            radar_input = radar_input.permute(0, 3, 1, 2)
+        
+        radar_features = self.radar_conv(radar_input)
+        radar_features = F.relu(radar_features)
         
         # 连接特征
         rgb_flat = rgb_features.flatten(start_dim=1)

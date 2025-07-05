@@ -152,8 +152,7 @@ def build_model(config, device):
             optimizer,
             mode='min',
             factor=config['training']['lr_gamma'],
-            patience=config['training']['lr_step_size'] // 2,
-            verbose=True
+            patience=config['training']['lr_step_size'] // 2
         )
     else:
         raise ValueError(f"不支持的学习率调度器: {config['training']['lr_scheduler']}")
